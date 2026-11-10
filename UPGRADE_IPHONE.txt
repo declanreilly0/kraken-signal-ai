@@ -1,0 +1,32 @@
+KRAKEN SIGNAL LAB V2 — UPGRADE YOUR EXISTING IPHONE WEBSITE
+
+1. Download kraken_signal_lab_v2.zip from ChatGPT and tap it in Files to unzip.
+2. In Safari, open your existing GitHub repository:
+   https://github.com/declanreilly0/kraken-signal-ai
+3. Select Add file > Upload files.
+4. Upload these individual files from inside the extracted V2 folder:
+   app.py
+   engine.py
+   kraken_api.py  (new)
+   chart_ui.py    (new)
+   requirements.txt
+   README.md      (recommended)
+5. Commit changes to main. This replaces your old app.py with V2.
+6. Go back to the SAME Streamlit app URL you already have.
+   After GitHub deploy finishes, refresh Safari. If still showing V1,
+   open Streamlit Community Cloud > your app > reboot/redeploy.
+7. Tap 🌐 All markets to browse Kraken-listed spot pairs. Tap 📈 Chart to
+   search a ticker and set 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, or 15d.
+   Pinch/drag the chart or tap +, -, Fit. In chart settings choose
+   Plotly backup if the fast chart library won't load.
+
+DO NOT upload the .zip as a single file to GitHub.
+DO NOT upload any Kraken password, trading key or OpenAI API key.
+The old kraken_market.py can stay; V2 doesn't use it.
+
+Historical limit: Kraken REST returns at most 720 recent candles per
+interval. 1m therefore only spans roughly 12 hours. Date controls filter
+that available window; they cannot fetch older candles automatically.
+
+This scanner watches public spot markets, but does NOT execute trades,
+monitor while closed, or guarantee any strategy will make money.
