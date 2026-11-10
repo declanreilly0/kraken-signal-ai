@@ -31,12 +31,14 @@ class Market:
     status: str
     is_meme_hint: bool
     minimum_order: float | None = None
+    minimum_cost: float | None = None
+    tick_size: float | None = None
 
 
 def _get(endpoint: str, params: dict | None = None) -> dict:
     response = requests.get(
         f"{ROOT}/{endpoint}", params=params or {}, timeout=(5, 15),
-        headers={"User-Agent": "KrakenSignalLabV2/2.0 educational-readonly"},
+        headers={"User-Agent": "KrakenSignalLabV3/3.0 educational-readonly"},
     )
     response.raise_for_status()
     body = response.json()
@@ -76,9 +78,18 @@ def parse_market_catalog(payload: dict, online_only: bool = True) -> list[Market
             minimum = float(minimum) if minimum is not None else None
         except (TypeError, ValueError):
             minimum = None
+        costmin=value.get("costmin")
+        try: costmin=float(costmin) if costmin is not None else None
+        except (TypeError,ValueError): costmin=None
+        tick=value.get("tick_size")
+        if tick is None and value.get("pair_decimals") is not None:
+            try:tick=10**(-int(value["pair_decimals"]))
+            except (TypeError,ValueError):tick=None
+        try: tick=float(tick) if tick is not None and float(tick)>0 else None
+        except (TypeError,ValueError):tick=None
         markets.append(Market(pair_id=str(pair_id), name=f"{base}/{quote}", base=base,
                               quote=quote, status=status, is_meme_hint=meme,
-                              minimum_order=minimum))
+                              minimum_order=minimum, minimum_cost=costmin, tick_size=tick))
     return sorted(markets, key=lambda m: (m.base, m.quote, m.pair_id))
 
 
@@ -169,7 +180,8 @@ def label_price(price: float, quote: str) -> str:
         return "—"
     prefix = {"GBP": "£", "USD": "$", "EUR": "€"}.get(quote, "")
     suffix = "" if prefix else f" {quote}"
-    precision = (2 if price >= 100 else 4 if price >= 1 else 6 if price >= 0.001 else 9)
+    precision = (2 if price >= 100 else 4 if price >= 1 else 6 if price >= 0.001
+                 else 9 if price >= .0000001 else 12 if price >= .0000000001 else 15)
     return f"{prefix}{price:,.{precision}f}{suffix}"
 
 

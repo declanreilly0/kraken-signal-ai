@@ -1,32 +1,35 @@
-KRAKEN SIGNAL LAB V2 — UPGRADE YOUR EXISTING IPHONE WEBSITE
+KRAKEN MEME SIGNAL RADAR — V3 — IPHONE UPGRADE
 
-1. Download kraken_signal_lab_v2.zip from ChatGPT and tap it in Files to unzip.
-2. In Safari, open your existing GitHub repository:
+1. Download Kraken_Signal_Radar_V3.zip to your iPhone and tap the ZIP in Files → Downloads to unzip.
+2. In Safari, open your EXISTING repo:
    https://github.com/declanreilly0/kraken-signal-ai
-3. Select Add file > Upload files.
-4. Upload these individual files from inside the extracted V2 folder:
+3. Tap Add file → Upload files. If hidden, use Safari's Request Desktop Website.
+4. Upload these files from the unzipped V3 folder to the MAIN repository folder:
+
    app.py
+   radar.py
+   discovery.py
    engine.py
-   kraken_api.py  (new)
-   chart_ui.py    (new)
+   kraken_api.py
+   chart_ui.py
    requirements.txt
-   README.md      (recommended)
-5. Commit changes to main. This replaces your old app.py with V2.
-6. Go back to the SAME Streamlit app URL you already have.
-   After GitHub deploy finishes, refresh Safari. If still showing V1,
-   open Streamlit Community Cloud > your app > reboot/redeploy.
-7. Tap 🌐 All markets to browse Kraken-listed spot pairs. Tap 📈 Chart to
-   search a ticker and set 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, or 15d.
-   Pinch/drag the chart or tap +, -, Fit. In chart settings choose
-   Plotly backup if the fast chart library won't load.
+   README.md
+   (optional UPGRADE_IPHONE.txt)
 
-DO NOT upload the .zip as a single file to GitHub.
-DO NOT upload any Kraken password, trading key or OpenAI API key.
-The old kraken_market.py can stay; V2 doesn't use it.
+   The files must be INSIDE the repo, NOT a ZIP and NOT nested under another folder.
+   Replacing app.py, engine.py, requirements.txt and the others is intentional.
+5. Tap Commit changes → Commit directly to main.
+6. Open your EXISTING Streamlit website. Let it redeploy and reload Safari.
+7. You should see "KRAKEN · SIGNAL RADAR / V3".
+8. On Best setups, read the first 8 deeply scanned candidates. Tap Scan next batch
+   to check more, or enable auto-scan in the sidebar WHILE THE APP IS OPEN.
+9. Select Meme-first (all coins), then inspect conditional buy/target/stop/profit cards.
+   Click "Open [coin] chart" to see candles. A WAIT/SKIP is NOT an invitation to trade.
 
-Historical limit: Kraken REST returns at most 720 recent candles per
-interval. 1m therefore only spans roughly 12 hours. Date controls filter
-that available window; they cannot fetch older candles automatically.
+If it fails: Streamlit → Manage app → Logs. Send a screenshot of the ERROR TEXT.
+Do not post Kraken passwords or private API keys in GitHub or screenshots.
 
-This scanner watches public spot markets, but does NOT execute trades,
-monitor while closed, or guarantee any strategy will make money.
+IMPORTANT: A first-pass snapshot covers Kraken online spot pairs, but only some
+are deeply analysed per batch. Newly discovered does not equal newly listed.
+New Solana meme coins not listed on Kraken are NOT available in this app.
+The app is research-only, with no Kraken account access or auto-execution.

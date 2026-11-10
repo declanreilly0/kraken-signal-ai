@@ -1,461 +1,373 @@
-"""Kraken Signal Lab V2: all-public-spot-market browser and paper-trading research.
+"""Kraken Signal Radar V3 — read-only, fee-aware, batched market research.
 
-Run: python -m streamlit run app.py
-Read-only: NO exchange authentication, wallet access, leverage, or trade placement.
+Streamlit Community Cloud entrypoint: app.py
+No account keys, auto-orders, leveraged instruments or synthetic live prices.
 """
 from __future__ import annotations
-from datetime import datetime, time as clock_time, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from html import escape
+import json
 import math
 import pandas as pd
-import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
+from engine import Costs, add_indicators
 from chart_ui import chart_html
-from engine import Costs, add_indicators, evaluate, historical_replay
-from kraken_api import (
-    TIMEFRAMES, Market, fetch_markets, fetch_all_tickers, fetch_quote,
-    fetch_ohlc, label_price, search_markets,
-)
+from kraken_api import (Market, TIMEFRAMES, fetch_markets, fetch_all_tickers,
+                        fetch_ohlc, label_price, _get)
+from discovery import record_seen
+from radar import (ScanSettings, conversion_rates_gbp, preliminary_rows,
+                   eligible_universe, plan_for_market, order_book_cost)
 
-st.set_page_config(page_title="Kraken Signal Lab · V2", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
-st.markdown("""
-<style>
-html,body,[data-testid="stApp"]{background:#0a1019}
-.block-container{padding-top:1.1rem;padding-bottom:2.3rem;max-width:1250px}
-h1,h2,h3{letter-spacing:-.028em}h1{font-size:1.55rem!important}h2{font-size:1.3rem!important}
-[data-testid="stVerticalBlock"]{gap:.70rem}
-[data-testid="stWidgetLabel"] p{font-size:.82rem;color:#a8b7c9}
-[data-testid="stMetric"]{background:#141f2d;border:1px solid #26364b;border-radius:12px;padding:11px 13px;min-height:85px}
-[data-testid="stMetricLabel"] p{font-size:.80rem;color:#98a9bc}
-[data-testid="stMetricValue"]{font-size:clamp(1.02rem,2.2vw,1.5rem)}
-[data-testid="stMetricDelta"]{font-size:.79rem}
-[data-testid="stButton"] button{border-radius:10px}
-[data-testid="stDataFrame"]{border-radius:10px;overflow:hidden}
-/* Horizontal view selector may scroll on narrow screens instead of pushing off screen. */
-[data-testid="stHorizontalBlock"]{gap:.55rem}
-.smallnote{color:#8d9db3;font-size:.78rem;line-height:1.45}
-.topline{font-size:.7rem;color:#b8a4f8;font-weight:800;letter-spacing:2px;margin:0 0 3px}
-.subline{font-size:.84rem;color:#899bb1;margin-bottom:12px}
-.tipbox{border:1px solid #293952;background:#111c2c;border-radius:12px;padding:12px 14px;color:#a9bed5;font-size:.85rem}
-.quotebar{display:flex;gap:8px;overflow-x:auto;white-space:nowrap;margin:3px 0 9px;padding:1px 0;scrollbar-width:none}.quotebar::-webkit-scrollbar{display:none}.quotebar>span{border:1px solid #2b374b;background:#141f2d;border-radius:10px;padding:9px 13px;display:inline-flex;flex-direction:column;gap:2px;min-width:max-content}.quotebar strong{color:#e9edf8;font-size:1.11rem}.quotebar small{color:#93a8c2;font-size:.70rem}.pill{display:inline-block;padding:3px 10px;border-radius:8px;font-size:.75rem;font-weight:700;margin:0 7px 4px 0}
-.pillup{background:#12392f;color:#55d8a8}.pilldown{background:#411e2b;color:#ff8098}.pillwait{background:#3b321f;color:#f7d183}
-@media(max-width:740px){.block-container{padding:1.0rem .72rem 1.7rem!important}h1{font-size:1.4rem!important}
-[data-testid="stMetric"]{padding:9px 10px;min-height:70px}
-[data-testid="stMetricValue"]{font-size:1.1rem}
-[data-testid="stHorizontalBlock"]{gap:.3rem}}
-</style>""", unsafe_allow_html=True)
+st.set_page_config(page_title="Meme Signal Radar V3", page_icon="📡", layout="wide", initial_sidebar_state="collapsed")
+st.markdown('''<style>
+html,body,[data-testid="stApp"] {background:#080d15;color:#e8f0ff}
+.block-container{max-width:1160px;padding-top:.8rem;padding-bottom:3rem}
+[data-testid="stVerticalBlock"]{gap:.62rem}
+h1,h2,h3{letter-spacing:-.03em}h1{font-size:clamp(1.7rem,4vw,2.5rem)!important;margin-bottom:0}
+h2{font-size:1.28rem!important}h3{font-size:1.08rem!important}
+[data-testid="stWidgetLabel"] p{font-size:.83rem;color:#a5b7cc}
+[data-testid="stMetric"]{background:#111f2e;border:1px solid #24354a;border-radius:13px;padding:11px 13px}
+[data-testid="stMetricLabel"] p{font-size:.8rem;color:#9eafc4}
+[data-testid="stMetricValue"]{font-size:1.26rem}
+[data-testid="stButton"] button{border-radius:11px;min-height:40px}
+[data-testid="stDataFrame"]{border-radius:11px;overflow:hidden}
+.muted{color:#a4b4c8;font-size:.86rem;line-height:1.45}
+.toptag{color:#46dfb4;font-size:.77rem;letter-spacing:2px;font-weight:800;margin-bottom:6px}
+.hero{font-size:.9rem;color:#a5b6ca;margin-bottom:16px}
+.notice{border:1px solid #30425a;border-radius:13px;background:#121f31;padding:11px 14px;color:#c2d2e8;font-size:.87rem}
+.good{border-color:#26745f;background:#102a25}.warn{border-color:#68502e;background:#2b2417}
+.plan{background:#111f30;border:1px solid #314257;border-radius:15px;padding:16px 18px;margin:9px 0}
+.plan-head{font-weight:800;font-size:1.13rem;display:flex;align-items:center;justify-content:space-between;gap:9px}
+.plan-sub{color:#a3b3c7;font-size:.8rem;margin-top:4px}
+.pill{font-size:.73rem;padding:5px 9px;border-radius:7px;display:inline-block;white-space:nowrap}
+.p-buy{background:#123a2e;color:#5ae1ae}.p-watch{background:#3b3020;color:#facd7d}.p-skip{background:#40202a;color:#ff9db0}
+.plan-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:12px 0}
+.plan-grid>div{padding:9px 7px;border:1px solid #2b3d52;border-radius:9px;min-width:0}
+.plan-grid small{display:block;color:#9dacc0;font-size:.68rem;line-height:1.4}
+.plan-grid strong{font-size:clamp(.82rem,2vw,1.12rem);overflow-wrap:anywhere}
+.plan-foot{font-size:.78rem;color:#b5c5d9;margin-top:10px}
+@media(max-width:760px){.block-container{padding:.76rem .68rem 2rem!important}
+[data-testid="stMetric"]{padding:8px 9px}
+[data-testid="stMetricValue"]{font-size:1.05rem}
+.plan-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+.plan{padding:12px}.plan-grid strong{font-size:.94rem}}
+</style>''',unsafe_allow_html=True)
 
-@st.cache_data(ttl=15 * 60, show_spinner=False)
-def catalog() -> list[Market]:
-    return fetch_markets()
+@st.cache_data(ttl=600,show_spinner=False)
+def markets_cached(): return fetch_markets()
 
-@st.cache_data(ttl=30, show_spinner=False)
-def quote_for(pair: str) -> dict:
-    return fetch_quote(pair)
+@st.cache_data(ttl=60,show_spinner=False)
+def tickers_cached(): return fetch_all_tickers()
 
-@st.cache_data(ttl=45, show_spinner=False)
-def candles_for(pair: str, interval: int) -> pd.DataFrame:
-    return fetch_ohlc(pair, interval)
+@st.cache_data(ttl=45,show_spinner=False)
+def candles_cached(pid:str,interval:int): return fetch_ohlc(pid,interval)
 
-@st.cache_data(ttl=90, show_spinner=False)
-def tickers_all() -> dict:
-    return fetch_all_tickers()
-
-
-def money(value: float, quote: str) -> str:
-    return label_price(value, quote)
-
-
-def safe_percent(x: float) -> str:
-    return f"{x:+.2f}%" if math.isfinite(x) else "—"
-
-
-def max_age_minutes(df: pd.DataFrame, interval: int) -> float:
-    last_close = df.index[-1] + pd.Timedelta(minutes=interval)
-    return max(0., (pd.Timestamp.now(tz="UTC") - last_close).total_seconds() / 60)
+@st.cache_data(ttl=40,show_spinner=False)
+def depth_cached(pid:str):
+    d=_get('Depth',{'pair':pid,'count':30})
+    if pid in d:return d[pid]
+    values=list(d.values())
+    if len(values)!=1:raise ValueError('Cannot identify Kraken depth response')
+    return values[0]
 
 
-def plotly_fallback(df: pd.DataFrame, quote: str, show_emas: bool, show_vol: bool, mode: str, interval: int):
-    nrows = 2 if show_vol else 1
-    fig = make_subplots(rows=nrows, cols=1, shared_xaxes=True, vertical_spacing=.03,
-                        row_heights=[.78, .22] if show_vol else [1.0])
-    if mode == "Candles":
-        fig.add_trace(go.Candlestick(x=df.index, open=df.open, high=df.high, low=df.low, close=df.close,
-                        name="Spot", increasing_line_color="#29cc9b", decreasing_line_color="#f36d87"),row=1,col=1)
-    else:
-        fig.add_trace(go.Scatter(x=df.index,y=df.close,name="Close",mode="lines",line=dict(color="#bba4ff",width=2)),row=1,col=1)
-    if show_emas:
-        for n,color in ((9,"#e7b86c"),(21,"#70aafb"),(50,"#b59cf9")):
-            fig.add_trace(go.Scatter(x=df.index,y=df[f"ema{n}"],name=f"EMA {n}",mode="lines",
-                                     line=dict(width=1.1,color=color)),row=1,col=1)
-    if show_vol:
-        colors = ["#27bb90" if c>=o else "#e15e7a" for o,c in zip(df.open,df.close)]
-        fig.add_trace(go.Bar(x=df.index, y=df.volume, name="Volume", marker_color=colors, showlegend=False),row=2,col=1)
-    fig.update_layout(template="plotly_dark",height=515,margin=dict(l=2,r=3,t=15,b=18),
-                      paper_bgcolor="#0b111b",plot_bgcolor="#0b111b",
-                      dragmode="pan", hovermode="x unified", legend=dict(orientation="h",y=1.10,x=0),
-                      uirevision="kraken-chart-" + quote + str(interval))
-    fig.update_xaxes(rangeslider=dict(visible=False), gridcolor="#263043", showgrid=True)
-    fig.update_yaxes(side="right",gridcolor="#25354a", tickprefix={"GBP":"£","USD":"$","EUR":"€"}.get(quote,""),row=1,col=1)
-    if show_vol:
-        fig.update_yaxes(gridcolor="#25354a",showticklabels=False,row=2,col=1)
-    st.plotly_chart(fig,config={"displaylogo":False,"scrollZoom":True,"displayModeBar":True,"responsive":True},use_container_width=True)
-    st.caption("Plotly backup: pinch/drag to zoom or pan, double-tap to reset; switch chart engine back to Touch chart when ready.")
+def money(n:float|None,quote:str):
+    if n is None or not math.isfinite(float(n)):return '—'
+    return label_price(float(n),quote)
 
 
-def explore_markets(all_markets: list[Market]):
-    st.markdown("### Every listed Kraken spot market")
-    st.caption("Pairs are discovered from Kraken's current public market catalogue. Meme labels are a curated hint, not an exhaustive or official Kraken category. Exchange account eligibility may differ by location.")
-    with st.spinner("Loading a single market-wide quote snapshot…"):
-        try:
-            tickers = tickers_all()
-            ticker_error = None
-        except Exception as exc:
-            tickers = {}
-            ticker_error = str(exc)
-    if ticker_error:
-        st.warning("Bulk ticker data is temporarily unavailable; the complete tradable-pair catalogue is still searchable. " + ticker_error)
-    k1,k2,k3 = st.columns(3)
-    k1.metric("Online spot pairs", f"{len(all_markets):,}")
-    k2.metric("Distinct coins", f"{len({m.base for m in all_markets}):,}")
-    k3.metric("Meme-tagged pairs",f"{sum(m.is_meme_hint for m in all_markets):,}")
-    s1,s2=st.columns([2.6,1.0])
-    with s1: query=st.text_input("Find any coin or pair",placeholder="DOGE, PEPE, BONK, SHIB, BTC, SOL…",key="screener_query")
-    with s2: kind=st.selectbox("Filter",["All markets","Meme watchlist","My favourites"],key="screener_kind")
-    quotes=sorted({m.quote for m in all_markets})
-    c1,c2=st.columns(2)
-    with c1: quote=st.selectbox("Quoted in",["All"] + quotes,index=0,key="screener_quote")
-    with c2: sort=st.selectbox("Sort by",["24h quote volume","Daily change %","Spread %","A–Z"],index=0,key="screener_sort")
-    matches=search_markets(all_markets, query, quote=quote, meme_only=(kind=="Meme watchlist"))
-    if kind=="My favourites":
-        favourites=set(st.session_state.get("favourites",[]))
-        matches=[m for m in matches if m.pair_id in favourites]
-    table=[]
-    pair_names={m.pair_id:m.name for m in all_markets}
-    for m in matches:
-        t=tickers.get(m.pair_id,{})
-        table.append({"Pair":m.name,"ID":m.pair_id,"Type":"Meme*" if m.is_meme_hint else "Spot",
-                      "Last":t.get("last",float("nan")),
-                      "Daily change %":t.get("change_open_pct",float("nan")),
-                      "24h quote volume":t.get("quote_volume_24h",float("nan")),
-                      "Spread %":t.get("spread_pct",float("nan"))})
-    frame=pd.DataFrame(table,columns=["Pair","ID","Type","Last","Daily change %","24h quote volume","Spread %"])
-    if sort=="A–Z": frame=frame.sort_values("Pair",ascending=True)
-    elif not frame.empty and sort in frame: frame=frame.sort_values(sort,ascending=(sort=="Spread %"),na_position="last")
-    st.caption(f"{len(frame):,} matching pairs • Last quote snapshot cached for up to 90 seconds • 'Daily change' compares the last price with Kraken's daily open, NOT an exact rolling 24h return • Volume in each pair's quote currency")
-    st.dataframe(frame.drop(columns=["ID"]).head(500),hide_index=True,use_container_width=True,height=430,
-                 column_config={"Last":st.column_config.NumberColumn(format="%.8g"),
-                                "Daily change %":st.column_config.NumberColumn(format="%+.2f%%"),
-                                "24h quote volume":st.column_config.NumberColumn(format="%.0f"),
-                                "Spread %":st.column_config.NumberColumn(format="%.3f%%")})
-    if len(frame)>500: st.caption("Displaying the first 500 matches; narrow the search to find other pairs. All catalogue pairs remain searchable.")
-    if frame.empty:
-        st.info("No matching markets. Remove filters or try another spelling; a coin may not have an active Kraken spot pair.")
-    else:
-        chosen = st.selectbox("Open any matching pair on chart",frame["ID"].tolist(),
-                              format_func=lambda x:pair_names.get(x,x),key="screener_open_pair")
-        if st.button("Open chart →",use_container_width=True,type="primary"):
-            st.session_state.pending_open=chosen
-            st.rerun()
-    st.caption("*Meme tag is approximate. All untagged meme coins are still found through normal search. No meme-coin classification or exchange listing is guaranteed to remain current.")
+def gbp(n:float|None)->str:
+    return '—' if n is None or not math.isfinite(float(n)) else f'£{n:+.2f}'
 
 
-def select_market(all_markets: list[Market]) -> Market:
-    by_id={m.pair_id:m for m in all_markets}
-    defaults=[m for symbol,quote in (("ETH","GBP"),("XBT","GBP"),("BTC","GBP"),("SOL","GBP"),("XDG","GBP"),("DOGE","USD"),("PEPE","USD"),("SHIB","USD"),("BONK","USD"))
-              for m in all_markets if m.base==symbol and m.quote==quote]
-    fallback=defaults[0] if defaults else all_markets[0]
-    if st.session_state.get("selected_id") not in by_id:
-        st.session_state.selected_id=fallback.pair_id
-    search = st.text_input("Search any Kraken coin or pair",placeholder="Type PEPE, WIF, BTC, BONK…",key="pair_search")
-    if search.strip():
-        matches=search_markets(all_markets,search)[:250]
-        if not matches:
-            st.warning("No currently online Kraken spot pairs match that search. Try a different ticker.")
-            matches=[by_id[st.session_state.selected_id]]
-    else:
-        # Keep the main selector fast on iPhone; use the Markets screen to browse thousands.
-        matches=[]
-        seen=set()
-        for m in [by_id[st.session_state.selected_id]]+defaults+all_markets[:75]:
-            if m.pair_id not in seen:
-                matches.append(m);seen.add(m.pair_id)
-    ids=[m.pair_id for m in matches]
-    idx=ids.index(st.session_state.selected_id) if st.session_state.selected_id in ids else 0
-    chosen=st.selectbox("Trading pair",ids,index=idx,format_func=lambda x:by_id[x].name,key="selected_market_widget")
-    st.session_state.selected_id=chosen
-    return by_id[chosen]
+def pct(n:float|None, signed:bool=False):
+    if n is None or not math.isfinite(float(n)):return '—'
+    return f'{n:+.2f}%' if signed else f'{n:.2f}%'
 
 
-def add_date_filter(df: pd.DataFrame) -> pd.DataFrame:
-    earliest, latest=df.index[0],df.index[-1]
-    dates=st.toggle("Custom UTC date & time range",value=False,help="Filters the data Kraken already provides; does not download older candles.")
-    if not dates:
-        return df
-    d1,d2=st.columns(2)
-    with d1:
-        start_date=st.date_input("Start date (UTC)",value=earliest.date(),key="date_from")
-        start_time=st.time_input("Start time (UTC)",value=earliest.time().replace(second=0,microsecond=0),key="time_from")
-    with d2:
-        end_date=st.date_input("End date (UTC)",value=latest.date(),key="date_to")
-        end_time=st.time_input("End time (UTC)",value=latest.time().replace(second=0,microsecond=0),key="time_to")
-    start=pd.Timestamp(datetime.combine(start_date,start_time,tzinfo=timezone.utc))
-    end=pd.Timestamp(datetime.combine(end_date,end_time,tzinfo=timezone.utc))
-    if start>end:
-        st.warning("Start must be earlier than end. Displaying all available candles.")
-        return df
-    cropped=df.loc[(df.index>=start)&(df.index<=end)]
-    if len(cropped)<2:
-        st.warning(f"No usable candles in that date range. Kraken supplied {earliest:%d %b %Y %H:%M} to {latest:%d %b %Y %H:%M} UTC for this timeframe. Showing all available candles.")
-        return df
-    st.caption(f"Displaying {len(cropped):,} candles from the selected UTC date range")
-    return cropped
+def tile(plan:dict, stake_gbp:float, show_why:bool=True):
+    status=plan['status']; css='p-buy' if status=='POTENTIAL BUY' else 'p-watch' if status=='WATCH' else 'p-skip'
+    entry=money(plan.get('entry'),plan['quote']); stop=money(plan.get('stop'),plan['quote']); target=money(plan.get('target'),plan['quote'])
+    result='—' if plan.get('profit_gbp') is None else gbp(plan['profit_gbp'])
+    loss='—' if plan.get('loss_gbp') is None else gbp(plan['loss_gbp'])
+    benefit= 'GBP spot' if plan['quote']=='GBP' else 'GBP-equivalent; FX not included'
+    header=f'''<div class="plan"><div class="plan-head"><span>{escape(plan['pair'])}</span><span class="pill {css}">{escape(status)}</span></div>
+    <div class="plan-sub">{int(plan.get('technical',0))}/5 technical conditions · {escape(benefit)} · {escape(str(plan.get('bar_count',0)))} candles</div>
+    <div class="plan-grid"><div><small>Buy trigger (reference)</small><strong>{escape(entry)}</strong></div>
+    <div><small>Sell target (hypothetical)</small><strong>{escape(target)}</strong></div>
+    <div><small>Stop level</small><strong>{escape(stop)}</strong></div>
+    <div><small>£{stake_gbp:.0f} if target hits</small><strong>{escape(result)}</strong></div>
+    <div><small>£{stake_gbp:.0f} if stopped</small><strong>{escape(loss)}</strong></div>
+    <div><small>Net reward / risk</small><strong>{(plan.get('rr') or 0):.2f}:1</strong></div></div>
+    <div class="plan-foot">Target profit is conditional, not predicted or guaranteed. Buy trigger is not an executable order quote.</div></div>'''
+    st.markdown(header,unsafe_allow_html=True)
+    if st.button(f"📈 Open {plan['pair']} chart",key=f"chart_jump_{plan['pair_id']}"):
+        st.session_state.pending_chart=plan['pair_id']
+        st.rerun()
+    if show_why and plan.get('reasons'):
+        with st.expander('Why this status?',expanded=False):
+            for reason in plan['reasons'][:8]:st.write('• '+reason)
 
 
-def quote_info(pair: Market) -> tuple[dict|None,str|None]:
+def scan_batch(rows:list[dict], by_id:dict[str,Market], tickers:dict,
+               rates:dict[str,float], settings:ScanSettings, selected:set[str], batch_size:int)->tuple[dict,dict]:
+    to_scan=[r for r in rows if r['pair_id'] not in selected][:batch_size]
+    output={};fail={}
+    def work(r):
+        pid=r['pair_id']; market=by_id[pid]
+        candles=fetch_ohlc(pid,settings.interval_minutes)
+        return plan_for_market(market,tickers[pid],candles,rates[market.quote],settings)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures={pool.submit(work,r):r for r in to_scan}
+        for fut in as_completed(futures):
+            pid=futures[fut]['pair_id']
+            try:output[pid]=fut.result()
+            except Exception as exc:fail[pid]=str(exc)[:180]
+    return output,fail
+
+
+def show_chart(market:Market,ticker:dict,interval:int):
+    st.markdown(f'#### {market.name} · interactive chart')
     try:
-        return quote_for(pair.pair_id),None
+        raw=candles_cached(market.pair_id,interval)
+        if len(raw)<2:raise ValueError('Insufficient candles')
+        df=add_indicators(raw)
+        st.caption(f'{len(df)} completed candles · UTC · Kraken OHLC (max 720 per interval)')
+        components.html(chart_html(df,market.quote,next((k for k,v in TIMEFRAMES.items() if v==interval),'5m')),
+                        height=510,scrolling=False)
+        with st.expander('Fallback chart (if the touch chart fails)',expanded=False):
+            import plotly.graph_objects as go
+            fig=go.Figure(data=[go.Candlestick(x=raw.index,open=raw.open,high=raw.high,
+                             low=raw.low,close=raw.close,name=market.name)])
+            fig.update_layout(template='plotly_dark',height=450,margin=dict(l=3,r=3,b=15,t=10),
+                              dragmode='pan',xaxis_rangeslider_visible=False,paper_bgcolor='#0b111b',plot_bgcolor='#0b111b')
+            st.plotly_chart(fig,use_container_width=True,config={'scrollZoom':True,'displaylogo':False})
+        return df
     except Exception as exc:
-        return None,str(exc)
+        st.error('Could not load these candles: '+str(exc)[:160])
+        return None
 
 
-def analyse_signal(df: pd.DataFrame, pair: Market, q: dict|None, fee: float, slippage: float, stake: float, interval: int):
-    from math import isfinite
-    if len(df)<65:
-        return None,None,f"Only {len(df)} completed candles available for this market; at least 65 are required for the research signal. Charting remains available."
-    spread=q["spread_pct"] if q and isfinite(q["spread_pct"]) else 0.1
-    costs=Costs(fee_pct_each_side=fee,slippage_pct_each_side=slippage,spread_pct_round_trip=spread)
-    result=evaluate(df,costs,stake,interval,spread_known=q is not None)
-    if max_age_minutes(df,interval)>max(interval*2,5):
-        result["reasons"].append("Market candles are stale; new entries blocked.")
-        if result["signal"]=="BUY SETUP": result["signal"]="WAIT"
-    if q and (q["spread_pct"]>0.5 or q.get("trades_24h",0)<100):
-        result["reasons"].append("Thin liquidity / wide spread filter: no new BUY setup on this market.")
-        if result["signal"]=="BUY SETUP": result["signal"]="WAIT"
-    return result,costs,None
-
-
-def layout_signal(result: dict|None, costs: Costs|None, pair: Market, fee: float, stake: float, err: str|None):
-    if err:
-        st.info(err)
-        return
-    if result is None:
-        return
-    status=result["signal"]
-    cls="pillup" if status=="BUY SETUP" else "pilldown" if status=="EXIT / AVOID" else "pillwait"
-    st.markdown(f'<span class="pill {cls}">{escape(status)}</span> <span class="smallnote">{result["score"]}/5 technical checks · research signal, not a prediction</span>',unsafe_allow_html=True)
-    a,b,c=st.columns(3)
-    a.metric("Illustrative entry",money(result["price"],pair.quote))
-    b.metric("Break-even rise",f'{result["break_even_pct"]:.2f}%')
-    c.metric("Cost-adjusted R/R",f'{result["net_rr"]:.2f}:1' if result['net_rr']>0 else "Not viable")
-    s1,s2=st.columns(2)
-    s1.metric("Illustrative target",money(result["target"],pair.quote),delta=f'{result["move_to_target_pct"]:+.2f}%')
-    s2.metric("Illustrative stop",money(result["stop"],pair.quote))
-    p1,p2=st.columns(2)
-    p1.metric(f"£{stake:.0f} stake · if target hit", f'£{result["expected_gain"]:+.2f}')
-    p2.metric(f"£{stake:.0f} stake · if stopped", f'£{result["expected_loss"]:+.2f}')
-    st.caption("Illustrative outcome, not expected profit. Fees, current spread and assumed slippage are modelled; live fills can differ. GBP P&L on non-GBP pairs is percentage-equivalent only, not an FX-adjusted cash forecast.")
-    with st.expander("See all five signal checks and reasons",expanded=False):
-        for label,passed in result["checks"].items():
-            st.write(("✅" if passed else "○")+" "+label)
-        st.progress(result["score"]/5)
-        for message in result["reasons"]: st.write("• "+message)
-        st.caption("A 4/5 checklist score is NOT a 80% chance of success. No AI model can establish next-minute prices reliably.")
-
-
-st.markdown('<div class="topline">KRAKEN SIGNAL LAB / VERSION 2</div>',unsafe_allow_html=True)
-st.title("Market explorer + signal research")
-st.markdown('<div class="subline">All Kraken online public spot markets · touch charts · £50 paper-trading analysis · no account connection</div>',unsafe_allow_html=True)
+st.markdown('<div class="toptag">KRAKEN · SIGNAL RADAR / V3</div>',unsafe_allow_html=True)
+st.title('Find potential trades. Not just charts.')
+st.markdown('<div class="hero">Scans live public Kraken spot-market snapshots, then checks candidate candles for entry triggers, profit targets, stops and modelled £50 outcomes.</div>',unsafe_allow_html=True)
 
 with st.sidebar:
-    st.subheader("⚙️ Trading assumptions")
-    stake=st.number_input("Paper trade size (£)",value=50.0,min_value=5.0,max_value=1_000_000.0,step=5.0)
-    order_type=st.radio("Order fee scenario",["Taker / market","Maker / resting limit"],index=0,
-                        help="Maker orders may not fill and may instead be charged taker fees.")
-    default_fee=.80 if order_type.startswith("Taker") else .40
-    fee=st.number_input("Fee per side (%)",min_value=0.0,max_value=5.0,value=default_fee,step=.05,format="%.2f",
-                        help="Check the current fee schedule for YOUR trading tier, pair, and order type.")
-    slippage=st.number_input("Extra slippage each side (%)",min_value=0.0,max_value=5.0,value=.05,step=.01,format="%.2f")
-    max_hold=st.slider("Maximum replay hold (candles)",5,120,30,5)
-    st.divider()
-    refresh=st.selectbox("Refresh while open",["Off","30 seconds","60 seconds","120 seconds"],index=0)
-    if st.button("↻ Fetch fresh market data",use_container_width=True):
-        candles_for.clear();quote_for.clear();tickers_all.clear()
-        st.rerun()
-    st.caption("Use Off to preserve chart zoom while exploring. The public REST feed cannot give guaranteed tick-level updates. Refresh never runs when this website is closed.")
-    st.divider()
-    st.caption("Read-only spot research. No Kraken login or private trading keys. Never use the derivatives tab for this tool.")
-    st.markdown("[Kraken Pro fee schedule](https://www.kraken.com/gb/pro/fees)")
+    st.subheader('⚙️ Scanner settings')
+    mode=st.radio('Find candidates in',['Meme-first (all coins)','All spot coins','Meme hints'],horizontal=False,index=0,
+                  help='All spot coins covers every Kraken pair in the first-pass screen. Meme hints uses a curated, incomplete ticker list.')
+    quote_pref=st.radio('Quoted in',['GBP preferred','GBP only'],index=0)
+    timeframe=st.selectbox('Signal timeframe',['1m','5m','15m','30m','1h','4h'],index=1)
+    order_type=st.radio('Order fee scenario',['Taker / market','Maker / resting limit'],index=0)
+    fee=st.number_input('Each-side fee (%)',min_value=0.,max_value=4.,value=.8 if order_type.startswith('Taker') else .4,step=.05,
+          help='Overrides are assumptions, not a promise that your Kraken account qualifies.')
+    slip=st.number_input('Slippage each side (%)',value=.05,min_value=0.,max_value=2.,step=.01)
+    stake=st.number_input('Paper stake (£)',min_value=5.0,max_value=100000.0,value=50.0,step=5.0)
+    max_loss=st.number_input('Maximum modelled loss (£)',min_value=.5,max_value=1000.,value=3.0,step=.5)
+    min_volume=st.select_slider('Minimum 24h GBP-equivalent turnover',options=[0,1000,5000,15000,50000,150000],value=5000,
+                               help='GBP-converted volume approximated from Kraken prices; does not ensure order-book depth.')
+    max_spread=st.select_slider('Maximum quoted spread',options=[.2,.5,1.,1.5,2.5,5.],value=1.5,format_func=lambda v:f'{v:g}%')
+    min_trades=st.select_slider('Minimum reported trades (24h)',options=[0,10,30,100,500],value=30)
+    batch_size=st.slider('Deep-scan candles per batch',4,16,8,2)
+    auto_scan=st.toggle('Scan next batch every 90s (while open)',value=False)
+    st.markdown('[Official Kraken Pro fees](https://www.kraken.com/gb/pro/fees)')
+    st.caption('Maker orders might never fill; do not treat the lower maker fees as guaranteed. This is read-only spot research.')
 
-if refresh!="Off":
-    st_autorefresh(interval={"30 seconds":30000,"60 seconds":60000,"120 seconds":120000}[refresh],key="refresh_public_market_data")
-
-try:
-    all_markets=catalog()
-except Exception as e:
-    st.error(f"Kraken's public market catalogue is unavailable: {e}. Try 'Fetch fresh market data' in the settings or reload the page.")
-    st.stop()
-
-if "selected_id" not in st.session_state:
-    pick=next((m for m in all_markets if m.name=="ETH/GBP"),all_markets[0])
-    st.session_state.selected_id=pick.pair_id
-if "favourites" not in st.session_state:st.session_state.favourites=[]
-if "view" not in st.session_state:st.session_state.view="📈 Chart"
-if "pending_open" in st.session_state:
-    st.session_state.selected_id=st.session_state.pop("pending_open")
-    st.session_state.view="📈 Chart"
-view=st.radio("Workspace",["📈 Chart","🌐 All markets","🎯 Signals","🧪 Replay","✨ AI analyst"],horizontal=True,
-              key="view",label_visibility="collapsed")
-
-if view=="🌐 All markets":
-    explore_markets(all_markets)
-    st.stop()
-
-l,r=st.columns([3.8,1.2],vertical_alignment="bottom")
-with l: selected=select_market(all_markets)
-with r:
-    is_fav=selected.pair_id in st.session_state.favourites
-    if st.button("★ Saved" if is_fav else "☆ Save pair",use_container_width=True):
-        fav=set(st.session_state.favourites)
-        if is_fav: fav.remove(selected.pair_id)
-        else: fav.add(selected.pair_id)
-        st.session_state.favourites=sorted(fav)
-        st.rerun()
-
-interval_names=list(TIMEFRAMES)
-small,wide=st.columns([1,1.15])
-with small:
-    timeframe=st.selectbox("Candle interval",interval_names,index=interval_names.index("1m"),
-                            key="interval_select",help="Kraken offers 1m as its lowest public candle interval.")
-with wide:
-    chart_mode=st.selectbox("Chart style",["Candles","Line"],index=0,key="mode_select")
-minutes=TIMEFRAMES[timeframe]
+# Refresh the rendered page for expiration checks even when auto-scanning is off.
+# Automatic next-batch analysis happens only if the user enables it.
+st_autorefresh(interval=90000,key='radar_expiry_refresh_v3')
+settings=ScanSettings(stake_gbp=stake,fee_pct=fee,slippage_pct=slip,max_loss_gbp=max_loss,
+    max_spread_pct=max_spread,min_volume_gbp=float(min_volume),min_trades_24h=min_trades,
+    interval_minutes=TIMEFRAMES[timeframe])
 
 try:
-    with st.spinner("Loading Kraken completed candles…"):
-        raw=candles_for(selected.pair_id,minutes)
-except Exception as e:
-    st.error(f"Couldn't load {selected.name} {timeframe} candles: {e}")
-    st.caption("Some recently listed or illiquid assets lack sufficient OHLC candles. The all-markets page is still available.")
+    with st.spinner('Fetching Kraken market catalogue and ticker snapshot…'):
+        all_markets=markets_cached();tickers=tickers_cached()
+    if not all_markets or not tickers:raise ValueError('Market catalogue or ticker data is empty')
+except Exception as exc:
+    st.error('Kraken market data is temporarily unavailable: '+str(exc)[:250])
+    st.info('Refresh the website later. Do not interpret an API outage as a trading signal.')
     st.stop()
-frame=add_indicators(raw)
-quote,quote_err=quote_info(selected)
-if quote_err:
-    st.warning("Live bid/ask unavailable; trading signal entries will be blocked. Chart candles may still be visible.")
-last_close=float(frame.close.iloc[-1])
-change=100*(last_close/float(frame.close.iloc[-2])-1) if len(frame)>1 else float("nan")
 
-spread_txt=f'{quote["spread_pct"]:.3f}%' if quote else 'Unavailable'
-price_txt=escape(money(last_close,selected.quote))
-bar_txt=escape(f"{len(frame)} bars")
-st.markdown(f'''<div class="quotebar">
- <span><small>{escape(selected.name)} · last closed candle</small><strong>{price_txt} <small>{safe_percent(change)}</small></strong></span>
- <span><small>Live bid / ask spread</small><strong>{escape(spread_txt)}</strong></span>
- <span><small>Visible history available</small><strong>{bar_txt}</strong></span>
- </div>''',unsafe_allow_html=True)
-st.caption(f"Kraken public spot · last complete bar: {frame.index[-1]:%d %b %H:%M} UTC · {len(all_markets):,} online markets")
-if selected.is_meme_hint:
-    st.markdown('<span class="pill pillwait">MEME WATCHLIST TAG • highly speculative</span>',unsafe_allow_html=True)
-if max_age_minutes(raw,minutes)>max(minutes*2,5):
-    st.warning("Latest completed candle looks stale, possibly due to no trades on this market. Do not assume the displayed price is executable now.")
+by_id={m.pair_id:m for m in all_markets}
+rates=conversion_rates_gbp(all_markets,tickers)
+rows=preliminary_rows(all_markets,tickers,rates)
+considered,counts=eligible_universe(rows,mode,quote_pref,float(min_volume),float(max_spread),int(min_trades))
+try:observed=record_seen(set(by_id))
+except Exception:observed={'initial_baseline':True,'new_ids':set(),'first_seen':{}}
+# Newly noticed Kraken markets get first access to deep-scanning if they pass
+# liquidity checks. 'First noticed' does not assert a real listing date.
+if observed['new_ids']:
+    considered.sort(key=lambda r:(r['pair_id'] in observed['new_ids'],r['meme'],r['pre_score']),reverse=True)
 
-result,costs,signal_error=analyse_signal(frame,selected,quote,fee,slippage,stake,minutes)
+# Reset scored results when assumptions or interval change. Session-based scan state;
+# refreshing the browser tab or host restart may lose progress.
+scan_key=(mode,quote_pref,timeframe,order_type,round(fee,3),round(slip,3),float(stake),float(max_loss),
+          min_volume,max_spread,min_trades)
+if st.session_state.get('scan_key')!=scan_key:
+    st.session_state.scan_key=scan_key
+    st.session_state.plans={}
+    st.session_state.failed={}
 
-if view=="📈 Chart":
-    with st.expander("⚙️ Chart options · date/time range · backup",expanded=False):
-        engine=st.selectbox("Chart engine",["Touch chart (fast)","Plotly backup"],index=0,key="chart_engine")
-        overlays=st.toggle("EMA 9/21/50",value=True,key="chart_ema")
-        volume=st.toggle("Volume",value=True,key="chart_vol")
-        st.caption(f"Kraken supports up to 720 recent candles per interval. Available: {raw.index[0]:%d %b %Y %H:%M} – {raw.index[-1]:%d %b %Y %H:%M} UTC. Older charts need another historical source.")
-        window=add_date_filter(frame)
-    if "window" not in locals(): window=frame
-    if engine.startswith("Touch"):
-        components.html(chart_html(window,selected.quote,timeframe,show_ema=overlays,
-                                   show_volume=volume,chart_type=chart_mode),height=510,scrolling=False)
-        st.caption("Touch chart: drag sideways to pan, pinch to zoom, or tap + / − / Fit. Crosshair shows each candle's OHLC and time. If a chart script is blocked, choose Plotly backup.")
+scan_now= not st.session_state.plans and not st.session_state.failed
+controls1,controls2=st.columns([1.4,1.0])
+with controls1: more=st.button('📡 Scan next batch',type='primary',use_container_width=True,
+                               help='Deep-check the next batch of candidates (candles fetched per pair).')
+with controls2: reset=st.button('↻ Restart scan',use_container_width=True,
+                                help='Clear prior signal analysis and recheck highest-ranked candidates.')
+if reset:
+    st.session_state.plans={};st.session_state.failed={}
+    candles_cached.clear();tickers_cached.clear();st.rerun()
+if more or scan_now or auto_scan:
+    scanned=set(st.session_state.plans)|set(st.session_state.failed)
+    if len(scanned)>=len(considered) and auto_scan and considered:
+        # Old results are not left permanently frozen once all candidates have been visited.
+        st.session_state.plans={};st.session_state.failed={};scanned=set()
+    if len(scanned)<len(considered):
+        with st.spinner(f'Analysing up to {batch_size} Kraken candle charts…'):
+            found,failed=scan_batch(considered,by_id,tickers,rates,settings,scanned,batch_size)
+            st.session_state.plans.update(found)
+            st.session_state.failed.update(failed)
+
+plans=list(st.session_state.plans.values())
+plan_ids=set(st.session_state.plans)|set(st.session_state.failed)
+def scan_is_fresh(plan):
+    try:
+        ts=datetime.fromisoformat(plan['scanned_at'])
+        return (datetime.now(timezone.utc)-ts).total_seconds() <= max(120,settings.interval_minutes*60*2)
+    except (KeyError,TypeError,ValueError):return False
+qualified=[x for x in plans if x['status']=='POTENTIAL BUY' and scan_is_fresh(x)]
+qualified.sort(key=lambda x:(x.get('rr') or 0,x['technical']),reverse=True)
+watch=[x for x in plans if x['status']=='WATCH' and scan_is_fresh(x)]
+watch.sort(key=lambda x:(x['technical'],x.get('signal_strength',0)),reverse=True)
+
+k1,k2,k3=st.columns(3)
+k1.metric('Kraken spot pairs',f'{len(all_markets):,}')
+k2.metric('Deep checked',f'{len(plan_ids):,} / {len(considered):,}')
+k3.metric('Qualifying setups',f'{len(qualified)}')
+st.progress(min(1,len(plan_ids)/max(1,len(considered))))
+st.caption(f'{len({m.base for m in all_markets}):,} distinct base symbols · {counts["passes_liquidity"]:,} pairs pass first-pass filters · {len(considered)} deduplicated candidate coins · market data cached briefly')
+
+if observed['new_ids']:
+    newly=[by_id[x].name for x in observed['new_ids'] if x in by_id]
+    st.info(f'{len(newly)} pairs newly noticed by this app instance: '+', '.join(newly[:20])+('…' if len(newly)>20 else '')+'. First-seen times are NOT official listing dates.')
+else:
+    st.caption('New listings: this app includes newly available Kraken spot pairs on catalogue refresh. It cannot trade coins before Kraken lists them; “first seen” is not an official listing timestamp.')
+
+expired=sum(not scan_is_fresh(p) for p in plans)
+if expired:
+    st.caption(f'{expired} old result(s) are now expired and are NOT shown as current potential trades. Tap Restart scan for fresh analysis.')
+if not considered:
+    st.warning('No pairs meet those quote/liquidity filters. Widen the settings to explore more coins. No trade signal is available.')
+
+if st.session_state.get('pending_chart'):
+    st.session_state.screen_view='📈 Chart & depth'
+    st.session_state.focus_pair_id=st.session_state.pending_chart
+    st.session_state.chart_search=by_id[st.session_state.pending_chart].base
+    del st.session_state.pending_chart
+view=st.radio('Choose screen',['🎯 Best setups','🌐 All markets','📈 Chart & depth','🧠 AI / method'],horizontal=True,key='screen_view')
+if view=='🎯 Best setups':
+    if qualified:
+        st.markdown('### Potential trade setups')
+        st.markdown('<div class="notice good">These candidates passed the model rules at their last scan. Recheck current Kraken bid/ask and candle freshness before any decision. A pass is not a guarantee of profit.</div>',unsafe_allow_html=True)
+        for candidate in qualified[:8]:tile(candidate,stake)
     else:
-        plotly_fallback(window,selected.quote,overlays,volume,chart_mode,minutes)
-    if result:
-        st.markdown("#### Latest research signal")
-        layout_signal(result,costs,selected,fee,stake,None)
-    else:
-        st.info(signal_error)
-    csv=raw.to_csv(index_label="time_utc").encode("utf-8")
-    st.download_button("↓ Download visible market's available candles (CSV)",data=csv,
-                       file_name=f"kraken_{selected.name.replace('/','_')}_{timeframe}_completed.csv",mime="text/csv")
+        st.markdown('<div class="notice warn"><b>NO ACTIONABLE SETUP FOUND IN SCANNED PAIRS.</b><br/>That is a valid outcome. The scanner will not invent a BUY signal just to have something to show.</div>',unsafe_allow_html=True)
+    st.markdown('### Closest candidates to watch')
+    if watch:
+        for candidate in watch[:8]:tile(candidate,stake)
+    elif plans:
+        st.info('Nothing passes even the WATCH checks in these batches. These are the strongest rejected candidates, NOT buy recommendations:')
+        rejects=sorted([p for p in plans if p['status']=='SKIP' and scan_is_fresh(p) and p.get('entry') is not None],
+                       key=lambda p:(p['technical'],p.get('signal_strength',0)),reverse=True)
+        for candidate in rejects[:3]:tile(candidate,stake)
+    else:st.info('No candle results returned yet. Check Kraken availability and scan another batch.')
+    with st.expander('See all completed deep-scan results'):
+        tab=[]
+        for x in sorted(plans,key=lambda v:(v['technical'],v.get('signal_strength',0)),reverse=True):
+            tab.append({'Coin':x['pair'],'Signal':x['status'],'Checks':f"{x['technical']}/5",
+                'Buy trigger':x.get('entry'), 'Sell target':x.get('target'),
+                '£50 profit if hit':x.get('profit_gbp'),'£50 loss if stopped':x.get('loss_gbp'),
+                'Modelled R/R':x.get('rr'),'Spread %':x.get('spread_pct')})
+        if tab:st.dataframe(pd.DataFrame(tab),hide_index=True,use_container_width=True,height=420)
+        for pid,error in list(st.session_state.failed.items())[:12]:
+            st.caption(f'Could not deeply scan {by_id.get(pid).name if pid in by_id else pid}: {error}')
+    st.caption('RANKING LIMIT: only deep-scanned coins can appear as potential buys. A bulk ticker snapshot surveys all online spot pairs, but this is NOT a simultaneous 1-minute candle analysis of every market.')
 
-elif view=="🎯 Signals":
-    st.markdown("### Technical setup and trade costs")
-    layout_signal(result,costs,selected,fee,stake,signal_error)
-    if quote:
-        st.caption(f"Last trade: {money(quote['last'],selected.quote)} • Bid: {money(quote['bid'],selected.quote)} • Ask: {money(quote['ask'],selected.quote)} • Trades in the last 24h: {quote['trades_24h']:,}")
-    st.info("This signal engine evaluates the SELECTED pair's completed candles; it does not calculate minute-by-minute signals for every Kraken asset simultaneously. The All markets tab is a broad ticker screener.")
+if view=='🌐 All markets':
+    st.markdown('### All Kraken spot markets — first-pass screener')
+    st.caption('Filter by any symbol including untagged/new meme coins. This table contains ticker statistics, not deep-scanned BUY signals.')
+    query=st.text_input('Search symbol or pair',placeholder='PEPE, WIF, BONK, new token…',key='all_search')
+    only_meme=st.toggle('Show curated meme hints only (incomplete classification)',value=False)
+    filtered=[r for r in rows if (not query or query.upper().strip() in r['pair'].upper())
+              and (not only_meme or r['meme'])]
+    filtered.sort(key=lambda x:x['pre_score'],reverse=True)
+    display=[{'Pair':r['pair'],'Meme hint':'Yes' if r['meme'] else '',
+       'Daily change %':r['change_pct'],'Vol 24h £-equiv':r['volume_gbp'],
+       'Spread %':r['spread_pct'],'Trades 24h':r['trades'],'Initial screen rank':r['pre_score']}
+       for r in filtered[:700]]
+    st.dataframe(pd.DataFrame(display),hide_index=True,use_container_width=True,height=465)
+    st.caption(f'{len(filtered):,} matching markets; showing up to 700. Quotes are a cached public snapshot. Volume conversions are approximate.')
 
-elif view=="🧪 Replay":
-    st.markdown("### Historical replay — paper trading only")
-    st.caption("Strict next-bar entries and conservative stop-first execution when a candle touches both stop and target. Current spread/fee assumptions are applied retrospectively, not actual historical spreads. Only the available ~720 completed Kraken candles can be tested.")
-    if signal_error:
-        st.info(signal_error)
-    elif costs:
-        trades=historical_replay(frame,costs,stake,max_hold_bars=max_hold)
-        if trades.empty:
-            st.warning("No qualifying historical entries with the current pair, fee and risk settings. Zero entries is not a broken chart, and it is not evidence of profitability.")
-        else:
-            win=100*(trades.pnl>0).mean(); pnl=float(trades.pnl.sum())
-            a,b,c=st.columns(3)
-            a.metric("Simulated trades",len(trades))
-            b.metric("Win rate",f"{win:.1f}%")
-            c.metric("Total paper P&L",f"£{pnl:+.2f}")
-            st.dataframe(trades.rename(columns={"signal_utc":"Signal time UTC","entry_utc":"Entry UTC","exit_utc":"Exit UTC","pnl":"Net P&L (£)"}),
-                         hide_index=True,use_container_width=True,height=310)
-            st.download_button("↓ Export replay trades",trades.to_csv(index=False).encode(),
-                               file_name=f"replay_{selected.name.replace('/','_')}_{timeframe}.csv",mime="text/csv")
-        st.info("A positive replay is not proof of a repeatable edge. Small samples, market changes, partial fills, latency, tax and unavailable historical bid/ask data can make real performance much worse.")
+if view=='📈 Chart & depth':
+    st.markdown('### Inspect any market')
+    search=st.text_input('Find pair',placeholder='DOGE, PEPE, WIF, ETH/GBP…',key='chart_search')
+    matching=[m for m in all_markets if search.strip().upper() in m.name.upper() or search.strip().upper() in m.pair_id.upper()]
+    preferred=sorted(matching,key=lambda m:(m.pair_id!=st.session_state.get('focus_pair_id'),m.quote!='GBP',m.name))[:300]
+    if preferred:
+        market=st.selectbox('Market',preferred,format_func=lambda m:m.name,key='chart_select')
+        chart_tf=st.selectbox('Chart interval',list(TIMEFRAMES),index=list(TIMEFRAMES).index(timeframe),key='chart_interval')
+        chart_ticker=tickers.get(market.pair_id)
+        if chart_ticker:st.caption(f'Latest quote: {money(chart_ticker["last"],market.quote)} · Spread: {pct(chart_ticker["spread_pct"])}')
+        show_chart(market,chart_ticker,TIMEFRAMES[chart_tf])
+        st.markdown('#### Check current order-book depth for £50')
+        if st.button('Estimate immediate buy/sell impact for selected pair',use_container_width=True):
+            if market.quote not in rates:
+                st.warning('No quote-to-GBP conversion available for this market; depth check disabled.')
+            else:
+                try:
+                    depth=depth_cached(market.pair_id)
+                    hypothetical_quote=stake/rates[market.quote]
+                    impact=order_book_cost(depth.get('asks',[]),depth.get('bids',[]),hypothetical_quote)
+                    if not impact['fillable']:st.warning(impact['detail'])
+                    else:
+                        st.metric('Instantaneous buy-and-sell depth cost before fees',pct(impact['instant_spread_impact_pct']))
+                        st.caption('A static order-book snapshot, not a promised fill. Fees, FX, latency and price changes are NOT included in this depth-only estimate.')
+                except Exception as e:st.warning('Depth unavailable: '+str(e)[:180])
+    else:st.warning('No listed Kraken spot pair matches that search.')
 
-elif view=="✨ AI analyst":
-    st.markdown("### AI second opinion")
-    st.write("Ask an OpenAI model to **critique** the selected pair's indicators and explain risks. This is on-demand commentary, not a live price predictor, and it cannot place orders.")
-    st.caption("A separate OpenAI Platform API key and API billing are required. ChatGPT Plus is not API credit. Never enter your Kraken credentials here.")
-    key=st.text_input("OpenAI Platform API key",type="password",placeholder="sk-…",help="Only for your request to OpenAI. Keep this app private if you don't want to expose your controls.")
-    model=st.selectbox("Model",["gpt-4.1-mini","gpt-4.1","gpt-5-mini"],index=0)
-    if st.button("Critique current setup with AI",type="primary",use_container_width=True):
-        if not key.strip().startswith("sk-"):
-            st.error("Enter a genuine OpenAI Platform API key created at platform.openai.com/api-keys.")
-        elif not result:
-            st.info(signal_error)
+if view=='🧠 AI / method':
+    st.markdown('### What the scanner does')
+    st.write('**Step 1:** Kraken AssetPairs + one market-wide Ticker snapshot screens all currently online public spot pairs, including tokens added since the catalogue last refreshed.')
+    st.write('**Step 2:** Quote liquidity, spread and activity determine which pairs are suitable for deeper analysis. One preferred fiat/stablecoin market per base coin is queued.')
+    st.write('**Step 3:** Up to the batch size of OHLC charts are fetched at a time. EMA, RSI, breakout, relative volume and candle checks are evaluated on completed candles only.')
+    st.write('**Step 4:** An illustrative entry trigger, volatility-based target and stop are checked against both trading fees, spread, slippage, maximum loss and net reward/risk.')
+    st.write('**Step 5:** The list shows POTENTIAL BUY, WATCH, SKIP or LIMITED HISTORY; nothing automatically trades.')
+    st.warning('A buy label is NOT a prediction of the next 1–5 minute price move. The £50 figure is what the model computes **if** the target were hit, not a forecast of expected profits. Backtesting and forward paper trading are needed to assess an edge.')
+    st.caption('New coins that Kraken has not yet listed cannot appear in this exchange-only scanner. The meme ticker list is incomplete. An untagged meme coin can still be examined via All spot coins and search. Quotes may vary by account and UK availability. Prices can move before you react.')
+    st.markdown('#### Optional AI explanation (requires separate OpenAI API billing)')
+    key=st.text_input('OpenAI API key — optional, never upload to GitHub',type='password',key='api_key_v3')
+    if st.button('Critique strongest scanned candidate with AI',disabled=not bool(plans),use_container_width=True):
+        candidate=(qualified or watch or plans)[0]
+        if not key:st.info('Enter an OpenAI API key or just use the free rule-based scanner.')
         else:
             try:
                 from openai import OpenAI
-                client=OpenAI(api_key=key.strip(),timeout=20,max_retries=1)
-                last=frame.iloc[-1]
-                compact=[{"UTC":str(x),"close":round(float(r.close),8),"volume":round(float(r.volume),4)}
-                         for x,r in frame.tail(25).iterrows()]
-                prompt={"pair":selected.name,"interval":timeframe,"signal":result['signal'],
-                        "checks":result['checks'],"rsi":float(last.rsi),"ema9":float(last.ema9) if pd.notna(last.ema9) else None,
-                        "ema21":float(last.ema21) if pd.notna(last.ema21) else None,
-                        "stop":result['stop'],"target":result['target'],"cost_break_even_pct":result['break_even_pct'],
-                        "estimated_gain_gbp_on_stake":result['expected_gain'],"stake_gbp":stake,
-                        "recent_completed_candles":compact}
-                import json
-                reply=client.responses.create(model=model,max_output_tokens=550,
-                         instructions=("You are a cautious crypto market researcher. Critique this spot chart setup in plain British English. "
-                         "Use only the data given. Explicitly explain uncertainty, false signals, spread and fee risks. "
-                         "Give possible bullish and bearish scenarios, not a deterministic BUY/SELL forecast, guaranteed return, or invented win rate. "
-                         "No leverage and no order placement. 220 words maximum."),
-                         input=json.dumps(prompt))
-                st.markdown(reply.output_text or "The model returned no text. Try a different model.")
-            except Exception as ex:
-                # Do not echo the server error body: providers may include identifying key fragments.
-                status=getattr(ex,"status_code",None)
-                if status==401: st.error("API authentication failed. Create a new valid secret key at platform.openai.com/api-keys.")
-                elif status==429: st.error("API rate limit or billing limit reached. Check the OpenAI Platform billing and usage settings.")
-                elif status==404: st.error("The chosen model isn't available to your API account. Select a different model.")
-                else: st.error(f"The model request failed (HTTP {status or 'network/other'}). Check your API connection, billing, and model permissions.")
+                record={k:v for k,v in candidate.items() if k in ('pair','status','technical','entry','target','stop','profit_gbp','loss_gbp','rr','reasons','break_even_pct','spread_pct','price_change_pct','volume_gbp')}
+                ans=OpenAI(api_key=key,timeout=18).chat.completions.create(
+                  model='gpt-4.1-mini',temperature=.1,max_tokens=450,
+                  messages=[{'role':'system','content':'You are a cautious UK retail crypto research assistant. Explain this hypothetical technical spot setup briefly. Avoid recommendations to trade, claims of certainty or probability, and never suggest leverage. Discuss market-data age, liquidity, fees, and what could invalidate the setup. Do not claim to see future/live data.'},
+                            {'role':'user','content':json.dumps(record,default=str)}])
+                st.write(ans.choices[0].message.content)
+            except Exception:
+                st.error('AI request failed. Check API key, available model and separate platform billing. The error is hidden to avoid exposing key details.')
+    st.markdown('#### Sources and caveats')
+    st.markdown('[Kraken Pro fees](https://www.kraken.com/gb/pro/fees) · [Kraken API market data](https://support.kraken.com/articles/360000919986-public-endpoint-examples-you-can-try-them-directly-in-a-web-browser-) · [Kraken listing roadmap](https://www.kraken.com/listings)')
+    st.caption('Kraken REST OHLC provides up to 720 recent bars and includes an unfinished final candle (excluded). Browser-hosted Streamlit does not keep monitoring while closed. Session scan results can become stale or be lost on host restart. No account API keys are required.')
 
 st.divider()
-st.caption("Version 2 • Read-only public spot market explorer • No futures, margin, auto-trading or wallet access. Technical rules are unverified; they can lose money. Cryptocurrency markets, especially meme coins, can move violently and have low liquidity.")
+st.caption(f"Data checked on app run: {datetime.now(timezone.utc):%d %b %Y %H:%M UTC} · Exchange-only, public data · Paper research · No orders · No leverage")
